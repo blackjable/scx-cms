@@ -57,6 +57,36 @@ u64 cms_cmp_max_over;
  * formality -- if this is ever non-zero, the sketch is wrong and any accuracy
  * figure taken from it is meaningless. Phase 1 checked the same invariant in
  * Python (paper Section 4.1.2) and found zero violations.
+ *
+ * KNOWN REMAINING GAP (tracked, not fixed -- see tests/regression.py,
+ * test_concurrent_stress and test_known_roll_race, both intentionally
+ * xfail): this CAN still be non-zero under concurrent same-identity
+ * access. Three lost-update bugs were found and fixed here (see exact.bpf.c
+ * and sketch.bpf.c) -- non-atomic c->cur++ and (*cell)++, and a BPF_ANY
+ * overwrite race on first touch. What's left is broader than either of
+ * those: cms_track()'s sequence of incrementing exact, incrementing
+ * sketch, then this function reading both is not atomic AS A UNIT, even
+ * though each individual step now is. A reader on one CPU can still
+ * observe one structure mid-update relative to the other when a
+ * different CPU is concurrently handling another wakeup of the same
+ * identity -- confirmed to scale directly with concurrency (0/9/110
+ * violations at 2/8/32 workers sharing one identity, on a window long
+ * enough that no rotation ever fired, ruling out cms_roll() specifically
+ * for this case). cms_roll()'s own three-field update has the same class
+ * of exposure, additionally triggered by real rotation.
+ *
+ * Both are the same underlying problem and would need the same fix: some
+ * form of per-identity mutual exclusion, most naturally a bpf_spin_lock.
+ * Deliberately left unfixed -- this codebase has no existing
+ * bpf_spin_lock usage to build from, and the risk of an unbounded
+ * debugging chase with no working reference was judged too high for the
+ * pass that found this. Practical impact is bounded: it requires genuine
+ * concurrent access to the same identity to trigger, which most
+ * measurements in this project's attack harnesses do not sustain at high
+ * enough intensity to matter (each attacker there is typically its own
+ * process with its own identity, not many threads hammering one shared
+ * identity the way `--identity-key comm` on a real multi-threaded
+ * workload can).
  */
 u64 cms_cmp_underestimates;
 
