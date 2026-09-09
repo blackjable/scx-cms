@@ -1,19 +1,26 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scx_cms -- a scx_simple-derived scheduler carrying a swappable
- * per-task identity abstraction (identity.bpf.c), built as the shell
- * for a Count-Min Sketch wakeup-frequency tracker (see the phase 2
- * handoff docs under .claude/sched_ext_phase2_handoff/).
+ * scx_cms -- a scx_simple-derived scheduler that tracks how often each
+ * task wakes, to study whether an approximate counter can replace an
+ * exact one under a fixed memory budget.
  *
  * The scheduling policy itself is unmodified scx_simple: a global
- * weighted-vtime scheduler with an optional FIFO mode. What's new here
- * is `runnable`/`quiescent` calling task_identity() -- the swappable
- * PID/TGID/comm abstraction -- on every wakeup and sleep transition, so
- * the tracking logic has a stable place to plug into later without
- * touching this file again. No sketch or exact-counter tracking is
- * wired up yet; only the identity resolution and observability
- * (runnable_events/quiescent_events counters) exist so this builds and
- * runs on its own before any tracking logic lands.
+ * weighted-vtime scheduler with an optional FIFO mode. What is added is
+ * a tracker fed from `runnable`, and a mechanism that can adjust a
+ * task's insertion vtime in `enqueue` based on what the tracker says.
+ * Each of the three moving parts is chosen at launch rather than
+ * compiled in, because each is an open question rather than a settled
+ * design:
+ *
+ *   identity.bpf.c   what counts as "the same task" (--identity-key)
+ *   tracker.bpf.c    exact counts or a sketch (--tracker)
+ *   mechanism.bpf.c  what to do with the count (--mechanism)
+ *
+ * Note that a mechanism only sees tasks that reach `enqueue`;
+ * `select_cpu` dispatches straight to a local queue whenever a CPU is
+ * idle, which on an unloaded machine is nearly everything. The stats
+ * output reports that fraction, because without it a result showing no
+ * effect cannot be told apart from a mechanism that never ran.
  *
  * Original scx_simple:
  * Copyright (c) 2022 Meta Platforms, Inc. and affiliates.
@@ -51,6 +58,7 @@ volatile u64 quiescent_events;
 
 #include "identity.bpf.c"
 #include "tracker.bpf.c"
+#include "probe.bpf.c"
 #include "mechanism.bpf.c"
 
 struct {
@@ -153,6 +161,7 @@ void BPF_STRUCT_OPS(cms_runnable, struct task_struct *p, u64 enq_flags)
 
 	tctx->identity = task_identity(p);
 	cms_track(tctx->identity);
+	cms_probe_update(p, tctx->identity);
 	__sync_fetch_and_add(&runnable_events, 1);
 }
 
