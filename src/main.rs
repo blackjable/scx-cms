@@ -60,28 +60,10 @@ impl IdentityKey {
     }
 }
 
-/// How a tracked wakeup count is turned into a scheduling decision. Neither
-/// shape is validated -- see mechanism.bpf.c. Values must stay in sync with
-/// `enum cms_mechanism_kind` in src/bpf/intf.h.
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum Mechanism {
-    /// Track only; scheduling is identical to unmodified scx_simple.
-    None,
-    /// Deprioritize frequent wakers.
-    Penalty,
-    /// Favor infrequent wakers.
-    Boost,
-}
-
-impl Mechanism {
-    fn as_bpf_const(self) -> u32 {
-        match self {
-            Mechanism::None => 0,
-            Mechanism::Penalty => 1,
-            Mechanism::Boost => 2,
-        }
-    }
-}
+// The `--mechanism` values, generated from CMS_MECHANISM_LIST in
+// src/bpf/mechanisms/index.h so the command line cannot drift from what is
+// actually compiled into the scheduler. Register new mechanisms there.
+include!(concat!(env!("OUT_DIR"), "/mechanisms.rs"));
 
 #[derive(Debug, Parser)]
 #[command(name = SCHEDULER_NAME, version, disable_version_flag = true)]

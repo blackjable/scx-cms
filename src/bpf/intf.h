@@ -39,18 +39,10 @@ enum cms_identity_key {
 };
 
 /*
- * How a task's tracked wakeup frequency turns into a scheduling decision.
- * Which shape is right is an open question the Phase 1 Python work did not
- * settle -- the penalty design showed no measurable sketch-vs-exact
- * difference, and the boost-style policy it compared against turned out to
- * be using oracle knowledge and collapsed to no advantage once corrected.
- * So both are selectable here and neither is assumed correct.
+ * Mechanism ids and names are NOT declared here. They are derived from
+ * CMS_MECHANISM_LIST in bpf/mechanisms/index.h, which is the single place
+ * a mechanism is registered -- see that file before adding one.
  */
-enum cms_mechanism_kind {
-	CMS_MECHANISM_NONE	= 0,	/* track only, never alter scheduling */
-	CMS_MECHANISM_PENALTY	= 1,	/* deprioritize frequent wakers */
-	CMS_MECHANISM_BOOST	= 2,	/* favor infrequent wakers */
-};
 
 enum tracker_consts {
 	/*
