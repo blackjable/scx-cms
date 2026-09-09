@@ -20,6 +20,7 @@ use clap::Parser;
 use clap::ValueEnum;
 use libbpf_rs::MapCore;
 use log::info;
+use log::warn;
 use scx_utils::build_id;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
@@ -124,6 +125,13 @@ struct Opts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     seed_rotation: bool,
 
+    /// Feed both counters every wakeup and report how far apart they land,
+    /// so sketch error is measured against the same event stream rather
+    /// than against a different run. Measures accuracy, not latency --
+    /// do not leave this on while benchmarking scheduling quality.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    compare: bool,
+
     /// Tracking window length; buffers rotate at this interval.
     #[clap(long, default_value_t = 1000)]
     window_ms: u64,
@@ -159,6 +167,7 @@ struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
     started_at: std::time::Instant,
+    compare: bool,
 }
 
 impl<'a> Scheduler<'a> {
@@ -184,6 +193,7 @@ impl<'a> Scheduler<'a> {
         rodata.cms_sketch_width = opts.sketch_width;
         rodata.cms_sketch_depth = opts.sketch_depth;
         rodata.cms_seed_rotation = opts.seed_rotation;
+        rodata.cms_compare = opts.compare;
         rodata.fifo_sched = opts.fifo;
         rodata.cms_identity_key = opts.identity_key.as_bpf_const();
         rodata.cms_mechanism = opts.mechanism.as_bpf_const();
@@ -200,6 +210,7 @@ impl<'a> Scheduler<'a> {
             skel,
             struct_ops: Some(struct_ops),
             started_at: std::time::Instant::now(),
+            compare: opts.compare,
         })
     }
 
@@ -230,17 +241,74 @@ impl<'a> Scheduler<'a> {
             .as_ref()
             .expect("bss_data missing -- BPF object has no .bss section");
 
+        let local = self.read_dsq_stat(0);
+        let global = self.read_dsq_stat(1);
+
+        // What fraction of dispatches the mechanism could influence at all.
+        //
+        // select_cpu dispatches straight to the local queue whenever it finds
+        // an idle CPU, bypassing enqueue -- where the mechanism lives --
+        // entirely. On an unloaded system that is nearly every dispatch, so a
+        // mechanism can be almost completely inert without anything looking
+        // wrong. Reported on every line because otherwise a null result is
+        // indistinguishable from a mechanism that never ran: if this is a
+        // fraction of a percent, the comparison said nothing about the
+        // mechanism, only about how idle the machine was.
+        let reach = if local + global > 0 {
+            global as f64 / (local + global) as f64 * 100.0
+        } else {
+            0.0
+        };
+
         info!(
-            "uptime={:>6.1}s  dispatches={}/{}  runnable={}  quiescent={}  windows={}  penalties={}  boosts={}",
+            "uptime={:>6.1}s  dispatch local={local} global={global} (mechanism reach {reach:.1}%)  \
+             runnable={}  quiescent={}  windows={}  penalties={}  boosts={}",
             self.started_at.elapsed().as_secs_f64(),
-            self.read_dsq_stat(0),
-            self.read_dsq_stat(1),
             bss.runnable_events,
             bss.quiescent_events,
             bss.cms_window_rotations,
             bss.cms_penalties_applied,
             bss.cms_boosts_applied,
         );
+
+        if !self.compare {
+            return;
+        }
+
+        let samples = bss.cms_cmp_samples;
+        if samples == 0 {
+            return;
+        }
+
+        let exact = bss.cms_cmp_exact_sum;
+        let sketch = bss.cms_cmp_sketch_sum;
+
+        // Ratio of sums over every queried identity -- NOT the same statistic
+        // as Phase 1's headline, which was the error on one tracked
+        // latency-sensitive task. Both are meaningful; conflating them is not.
+        let overestimate = if exact > 0 {
+            (sketch as f64 - exact as f64) / exact as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        info!(
+            "  compare: samples={samples} exact_mean={:.1} sketch_mean={:.1} \
+             overestimate={overestimate:+.1}% max_overshoot={}",
+            exact as f64 / samples as f64,
+            sketch as f64 / samples as f64,
+            bss.cms_cmp_max_over,
+        );
+
+        // Count-Min must never undercount. A non-zero value here means the
+        // port is wrong and every accuracy figure from this run is void.
+        if bss.cms_cmp_underestimates > 0 {
+            warn!(
+                "  compare: {} UNDERESTIMATES -- sketch violated the \
+                 never-undercount guarantee; this build is broken",
+                bss.cms_cmp_underestimates
+            );
+        }
     }
 
     fn exited(&self) -> bool {
@@ -293,6 +361,18 @@ fn main() -> Result<()> {
         "Starting {} scheduler (fifo={}, identity_key={:?}, mechanism={:?}, window={}ms)",
         SCHEDULER_NAME, opts.fifo, opts.identity_key, opts.mechanism, opts.window_ms
     );
+
+    // FIFO mode takes a different branch in enqueue and never consults the
+    // mechanism, so the two flags are silently incompatible. Say so rather
+    // than letting someone collect a run's worth of data from a scheduler
+    // that was never applying the mechanism they asked for.
+    if opts.fifo && opts.mechanism.as_bpf_const() != 0 {
+        warn!(
+            "--fifo bypasses the vtime path entirely, so --mechanism {:?} \
+             will have no effect on this run",
+            opts.mechanism
+        );
+    }
 
     if opts.tracker == Tracker::Sketch {
         info!(
