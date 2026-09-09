@@ -55,6 +55,16 @@ u32 cms_sketch_seeds[2][CMS_SKETCH_MAX_DEPTH];
 /* Which buffer inserts currently land in; the other holds last window. */
 u32 cms_sketch_cur;
 
+/*
+ * Seqlock around cms_sketch_rotate(): odd while a rotation is in
+ * progress, even and unchanged means nothing rotated across a read. A
+ * reader that only checked cms_sketch_cur before/after would miss a race
+ * landing inside the zeroing loop below, before cur has flipped but after
+ * some cells are already zeroed -- this catches that too, since the
+ * counter goes odd at the very start of rotate(), before any cell write.
+ */
+u64 cms_sketch_seq;
+
 u64 cms_sketch_rotations;
 
 /*
@@ -104,7 +114,7 @@ static __always_inline void cms_sketch_increment(u64 id)
 		cell = cms_sketch_cell(buf, row,
 				       cms_sketch_col(id, cms_sketch_seeds[buf][row]));
 		if (cell)
-			(*cell)++;
+			__sync_fetch_and_add(cell, 1);
 	}
 }
 
@@ -161,6 +171,8 @@ static __always_inline void cms_sketch_rotate(void)
 	u32 next = (cms_sketch_cur & 1) ^ 1;
 	u32 row, col;
 
+	__sync_fetch_and_add(&cms_sketch_seq, 1); /* now odd: rotation begins */
+
 	bpf_for(row, 0, cms_sketch_depth) {
 		if (row >= CMS_SKETCH_MAX_DEPTH)
 			break;
@@ -187,6 +199,7 @@ static __always_inline void cms_sketch_rotate(void)
 
 	cms_sketch_cur = next;
 	__sync_fetch_and_add(&cms_sketch_rotations, 1);
+	__sync_fetch_and_add(&cms_sketch_seq, 1); /* now even: rotation done */
 }
 
 static __always_inline void cms_sketch_init(void)

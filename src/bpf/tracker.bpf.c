@@ -60,11 +60,66 @@ u64 cms_cmp_max_over;
  */
 u64 cms_cmp_underestimates;
 
+/* Diagnostic-only: latches the first violation's raw state globally,
+ * since the per-pid probe only sees one task's wakeups and the
+ * violations are happening across many tasks under compare mode. */
+u64 diag_viol_seen;
+u64 diag_viol_id;
+u64 diag_viol_exact;
+u64 diag_viol_sketch;
+u64 diag_viol_epoch;
+u64 diag_viol_seq;
+u64 diag_viol_exact_cur;
+u64 diag_viol_exact_prev;
+u64 diag_viol_exact_epoch;
+
+/*
+ * cms_exact_query() and cms_sketch_query() each read state rotated by the
+ * same timer callback, but not atomically with respect to a caller that
+ * straddles both calls -- a real, if narrow, race. This seqlock
+ * (cms_sketch_seq in sketch.bpf.c) closes it: odd while a rotation is in
+ * progress, checked for change and parity across both reads, retried
+ * (bounded) rather than recording an inconsistent pair.
+ *
+ * NOTE ON HOW THIS WAS FOUND, kept because the investigation took a wrong
+ * turn worth recording: this was the first hypothesis for a
+ * never-undercount violation found under `hackbench` (633k in a few
+ * seconds). It was wrong as the explanation for THAT bug -- rebuilding
+ * with only this fix left violations at essentially the same rate (607k),
+ * and direct diagnostic instrumentation (latching the first violation's
+ * raw state) later showed the actual culprit hit at cms_epoch=0,
+ * cms_sketch_seq=0 -- before any rotation had ever occurred, ruling
+ * rotation out entirely for that case. The real cause was a lost-update
+ * race on the plain (non-atomic) `c->cur++` and `(*cell)++` increments
+ * under concurrent multi-CPU writes to the same map cell (fixed
+ * separately, see exact.bpf.c and sketch.bpf.c). This seqlock is still
+ * correct and worth keeping for the narrower race it actually addresses,
+ * but it was not the fix for the violations that were actually observed.
+ */
+static __always_inline bool cms_query_both(u64 id, u64 *exact, u64 *sketch)
+{
+	int i;
+
+#pragma unroll
+	for (i = 0; i < 4; i++) {
+		u64 seq_before = cms_sketch_seq;
+
+		*exact = cms_exact_query(id);
+		*sketch = cms_sketch_query(id);
+
+		if (seq_before == cms_sketch_seq && (seq_before & 1) == 0)
+			return true;
+	}
+
+	return false;
+}
+
 static __always_inline void cms_compare_sample(u64 id)
 {
-	u64 exact = cms_exact_query(id);
-	u64 sketch = cms_sketch_query(id);
-	u64 over;
+	u64 exact, sketch, over;
+
+	if (!cms_query_both(id, &exact, &sketch))
+		return;
 
 	__sync_fetch_and_add(&cms_cmp_samples, 1);
 	__sync_fetch_and_add(&cms_cmp_exact_sum, exact);
@@ -72,6 +127,22 @@ static __always_inline void cms_compare_sample(u64 id)
 
 	if (sketch < exact) {
 		__sync_fetch_and_add(&cms_cmp_underestimates, 1);
+
+		if (!diag_viol_seen) {
+			struct cms_count *c = bpf_map_lookup_elem(&cms_counts, &id);
+
+			diag_viol_seen = 1;
+			diag_viol_id = id;
+			diag_viol_exact = exact;
+			diag_viol_sketch = sketch;
+			diag_viol_epoch = cms_epoch;
+			diag_viol_seq = cms_sketch_seq;
+			if (c) {
+				diag_viol_exact_cur = c->cur;
+				diag_viol_exact_prev = c->prev;
+				diag_viol_exact_epoch = c->epoch;
+			}
+		}
 		return;
 	}
 

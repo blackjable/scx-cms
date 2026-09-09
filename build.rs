@@ -184,6 +184,16 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", index_path.display());
     println!("cargo:rerun-if-changed={MECHANISM_DIR}");
+    // scx_cargo's enable_skel only watches src/bpf/main.bpf.c itself, not
+    // the #include tree under it (trackers/, identity.bpf.c, etc. -- every
+    // .bpf.c file in this scheduler except main.bpf.c). Editing any of
+    // those without touching main.bpf.c produces a silent no-op build:
+    // hit this directly while fixing a real correctness bug, where a
+    // rebuild reported success in 0.12s without having recompiled
+    // anything. scx_flow and scx_cidland have the same gap, so this isn't
+    // specific to this scheduler, but watching the whole tree here is a
+    // one-line fix worth having regardless of whether it's fixed upstream.
+    println!("cargo:rerun-if-changed=src/bpf");
 
     let index = fs::read_to_string(&index_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", index_path.display()));

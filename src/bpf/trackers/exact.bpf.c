@@ -59,18 +59,43 @@ static __always_inline void cms_exact_increment(u64 id)
 {
 	struct cms_count *c, init;
 	u64 epoch = cms_epoch;
+	long err;
 
 	c = bpf_map_lookup_elem(&cms_counts, &id);
 	if (c) {
 		cms_roll(c, epoch);
-		c->cur++;
+		__sync_fetch_and_add(&c->cur, 1);
 		return;
 	}
 
+	/*
+	 * BPF_NOEXIST, not BPF_ANY: this is a genuine lost-update race with
+	 * BPF_ANY, found via direct diagnostic capture, not reasoning --
+	 * two CPUs racing cms_exact_increment() for the same not-yet-seen
+	 * identity (common under --identity-key comm, where many threads
+	 * share one identity and wake concurrently) can both see the lookup
+	 * above miss, and BPF_ANY unconditionally overwrites, so whichever
+	 * bpf_map_update_elem() runs second silently discards the first
+	 * one's cur=1 instead of the entry ending up at cur=2. Caught
+	 * because it made the sketch's separately-fixed atomic increment
+	 * look like it was STILL undercounting after that fix landed --
+	 * the exact side had a different, still-live lost-update bug of its
+	 * own on this path.
+	 */
 	__builtin_memset(&init, 0, sizeof(init));
 	init.epoch = epoch;
 	init.cur = 1;
-	bpf_map_update_elem(&cms_counts, &id, &init, BPF_ANY);
+	err = bpf_map_update_elem(&cms_counts, &id, &init, BPF_NOEXIST);
+	if (err) {
+		/* Lost the race: someone else just created it. Their insert
+		 * already counts as one increment; add ours to it instead of
+		 * silently dropping it. */
+		c = bpf_map_lookup_elem(&cms_counts, &id);
+		if (c) {
+			cms_roll(c, epoch);
+			__sync_fetch_and_add(&c->cur, 1);
+		}
+	}
 }
 
 /*

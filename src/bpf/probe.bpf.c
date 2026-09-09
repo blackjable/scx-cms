@@ -29,6 +29,17 @@ struct cms_probe {
 	u64 exact;	/* truth */
 	u64 sketch;	/* estimate; the gap between them is the attack */
 	u64 samples;
+	/* Diagnostic-only, added while chasing a spurious never-undercount
+	 * violation under hackbench: latches the first time sketch < exact
+	 * is observed for THIS pid, so the raw internal state at that exact
+	 * moment can be inspected instead of reasoning about the race
+	 * abstractly. Not needed once that bug is understood and fixed. */
+	u64 viol_seen;
+	u64 viol_epoch;
+	u64 viol_seq;
+	u64 viol_exact_cur;
+	u64 viol_exact_prev;
+	u64 viol_exact_epoch;
 };
 
 struct {
@@ -42,13 +53,33 @@ static __always_inline void cms_probe_update(struct task_struct *p, u64 id)
 {
 	struct cms_probe *pr;
 	u32 key = 0;
+	u64 exact, sketch;
 
 	pr = bpf_map_lookup_elem(&cms_probe, &key);
 	if (!pr || !pr->pid || (u32)p->pid != pr->pid)
 		return;
 
+	/* Same exact/sketch race as cms_compare_sample() in tracker.bpf.c --
+	 * see the comment on cms_query_both() there. This is a per-victim
+	 * probe read on every wakeup, so it hits the same window. */
+	if (!cms_query_both(id, &exact, &sketch))
+		return;
+
 	pr->identity = id;
-	pr->exact = cms_exact_query(id);
-	pr->sketch = cms_sketch_query(id);
+	pr->exact = exact;
+	pr->sketch = sketch;
 	pr->samples++;
+
+	if (sketch < exact && !pr->viol_seen) {
+		struct cms_count *c = bpf_map_lookup_elem(&cms_counts, &id);
+
+		pr->viol_seen = 1;
+		pr->viol_epoch = cms_epoch;
+		pr->viol_seq = cms_sketch_seq;
+		if (c) {
+			pr->viol_exact_cur = c->cur;
+			pr->viol_exact_prev = c->prev;
+			pr->viol_exact_epoch = c->epoch;
+		}
+	}
 }
