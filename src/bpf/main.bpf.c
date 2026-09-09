@@ -152,7 +152,7 @@ void BPF_STRUCT_OPS(cms_runnable, struct task_struct *p, u64 enq_flags)
 		return;
 
 	tctx->identity = task_identity(p);
-	cms_track_wakeup(tctx->identity);
+	cms_track(tctx->identity);
 	__sync_fetch_and_add(&runnable_events, 1);
 }
 

@@ -44,6 +44,37 @@ enum cms_identity_key {
  * a mechanism is registered -- see that file before adding one.
  */
 
+/*
+ * Which counting method backs the wakeup tracker. This is the study's
+ * independent variable -- the whole question is whether the approximate
+ * one can replace the exact one -- so unlike mechanisms it is a fixed
+ * pair rather than an extensible set, and is registered by hand.
+ */
+enum cms_tracker_kind {
+	CMS_TRACKER_EXACT	= 0,
+	CMS_TRACKER_SKETCH	= 1,
+};
+
+enum sketch_consts {
+	/*
+	 * Bounds for the loops the verifier must see terminate. The table
+	 * itself is sized at load time to exactly 2 * width * depth cells,
+	 * not to these maxima -- the sketch's entire claim is a small fixed
+	 * footprint, so an over-allocated table would make the measured
+	 * memory disagree with the reported memory.
+	 */
+	CMS_SKETCH_MAX_WIDTH	= 4096,
+	CMS_SKETCH_MAX_DEPTH	= 8,
+
+	/*
+	 * Phase 1's reference configuration (paper Section 4.1): a stable
+	 * ~31.9% overestimate against a 65.7x memory saving. Defaulting here
+	 * keeps kernel-side results directly comparable to that figure.
+	 */
+	CMS_DFL_SKETCH_WIDTH	= 256,
+	CMS_DFL_SKETCH_DEPTH	= 4,
+};
+
 enum tracker_consts {
 	/*
 	 * Upper bound on distinct identities tracked at once. The map is an

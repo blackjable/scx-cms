@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::bail;
 use anyhow::Result;
 use clap::Parser;
 use clap::ValueEnum;
@@ -65,6 +66,26 @@ impl IdentityKey {
 // actually compiled into the scheduler. Register new mechanisms there.
 include!(concat!(env!("OUT_DIR"), "/mechanisms.rs"));
 
+/// Which counting method backs the tracker. Hand-written rather than
+/// generated, unlike Mechanism: this is a fixed pair, not an extensible set.
+/// Must match `enum cms_tracker_kind` in src/bpf/intf.h.
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum Tracker {
+    /// Exact per-identity counts; memory grows with distinct tasks.
+    Exact,
+    /// Count-Min Sketch; fixed memory, approximate and never underestimates.
+    Sketch,
+}
+
+impl Tracker {
+    fn as_bpf_const(self) -> u32 {
+        match self {
+            Tracker::Exact => 0,
+            Tracker::Sketch => 1,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = SCHEDULER_NAME, version, disable_version_flag = true)]
 struct Opts {
@@ -82,6 +103,26 @@ struct Opts {
     /// (track only), which leaves scheduling identical to scx_simple.
     #[clap(long, value_enum, default_value = "none")]
     mechanism: Mechanism,
+
+    /// Which counting method backs the tracker. `exact` grows with the
+    /// number of distinct tasks; `sketch` is fixed size but approximate.
+    /// This is the study's independent variable.
+    #[clap(long, value_enum, default_value = "exact")]
+    tracker: Tracker,
+
+    /// Sketch columns per row (--tracker sketch). Wider is more accurate.
+    #[clap(long, default_value_t = 256)]
+    sketch_width: u32,
+
+    /// Sketch rows (--tracker sketch). Phase 1 found width buys more
+    /// accuracy than depth at a fixed memory budget.
+    #[clap(long, default_value_t = 4)]
+    sketch_depth: u32,
+
+    /// Re-seed each sketch buffer as it is recycled. Partially mitigates a
+    /// targeted-collision attack; does not eliminate it.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    seed_rotation: bool,
 
     /// Tracking window length; buffers rotate at this interval.
     #[clap(long, default_value_t = 1000)]
@@ -132,7 +173,17 @@ impl<'a> Scheduler<'a> {
 
         let mut skel = scx_ops_open!(skel_builder, open_object, cms_ops, None)?;
 
+        // Size the sketch table to exactly what was asked for. Reporting a
+        // memory saving means the table has to actually be that size, not a
+        // maximum with the unused part quietly costing memory anyway.
+        let cells = 2 * opts.sketch_width * opts.sketch_depth;
+        skel.maps.cms_sketch.set_max_entries(cells)?;
+
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
+        rodata.cms_tracker = opts.tracker.as_bpf_const();
+        rodata.cms_sketch_width = opts.sketch_width;
+        rodata.cms_sketch_depth = opts.sketch_depth;
+        rodata.cms_seed_rotation = opts.seed_rotation;
         rodata.fifo_sched = opts.fifo;
         rodata.cms_identity_key = opts.identity_key.as_bpf_const();
         rodata.cms_mechanism = opts.mechanism.as_bpf_const();
@@ -229,10 +280,32 @@ fn main() -> Result<()> {
     )?;
 
     info!("{} {}", SCHEDULER_NAME, full_version());
+    // Bounds the BPF side relies on for its loops; check here so the failure
+    // is a clear message rather than a verifier rejection.
+    if opts.sketch_width == 0 || opts.sketch_width > 4096 {
+        bail!("--sketch-width must be 1..=4096 (got {})", opts.sketch_width);
+    }
+    if opts.sketch_depth == 0 || opts.sketch_depth > 8 {
+        bail!("--sketch-depth must be 1..=8 (got {})", opts.sketch_depth);
+    }
+
     info!(
         "Starting {} scheduler (fifo={}, identity_key={:?}, mechanism={:?}, window={}ms)",
         SCHEDULER_NAME, opts.fifo, opts.identity_key, opts.mechanism, opts.window_ms
     );
+
+    if opts.tracker == Tracker::Sketch {
+        info!(
+            "Tracker: sketch, width={} depth={} seed_rotation={} \
+             ({} bytes fixed, both buffers)",
+            opts.sketch_width,
+            opts.sketch_depth,
+            opts.seed_rotation,
+            2 * opts.sketch_width * opts.sketch_depth * 4,
+        );
+    } else {
+        info!("Tracker: exact (memory grows with distinct identities)");
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
