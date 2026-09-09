@@ -316,13 +316,23 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>, stats_interval: Option<Duration>) -> Result<UserExitInfo> {
+        // Poll on a short fixed tick rather than sleeping for the stats
+        // interval, so that how promptly the scheduler responds to Ctrl-C
+        // does not depend on how often it was asked to print. Sleeping the
+        // full interval meant --stats 60 took up to a minute to detach,
+        // which looks like a hang and blocks anything scripting it.
+        const TICK: Duration = Duration::from_millis(250);
+        let mut next_print = std::time::Instant::now();
+
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
             if let Some(interval) = stats_interval {
-                self.print_stats();
-                std::thread::sleep(interval);
-            } else {
-                std::thread::sleep(Duration::from_millis(250));
+                let now = std::time::Instant::now();
+                if now >= next_print {
+                    self.print_stats();
+                    next_print = now + interval;
+                }
             }
+            std::thread::sleep(TICK);
         }
 
         let _ = self.struct_ops.take();
