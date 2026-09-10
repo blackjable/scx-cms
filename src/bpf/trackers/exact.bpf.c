@@ -39,6 +39,20 @@ struct {
  * rotations it slept through. One window missed means this window's counts
  * became last window's; two or more means both buffers are stale.
  */
+/*
+ * Distinct identities inserted, monotonic since load. Sampled by
+ * userspace over a known interval it gives the rate at which new
+ * identities appear, which is a property of the WORKLOAD rather than of
+ * the tracker -- so run it with a map large enough not to evict, and the
+ * rate is the live identity population per window.
+ *
+ * It exists because the churning-regime accuracy figures were validated
+ * against an assumed identity population that turned out to be wrong by
+ * 4x. Assuming this number instead of measuring it invalidated a round of
+ * conclusions; it is cheap to count and there is no reason to infer it.
+ */
+u64 cms_exact_inserts;
+
 static __always_inline void cms_roll(struct cms_count *c, u64 epoch)
 {
 	if (c->epoch == epoch)
@@ -86,6 +100,10 @@ static __always_inline void cms_exact_increment(u64 id)
 	init.epoch = epoch;
 	init.cur = 1;
 	err = bpf_map_update_elem(&cms_counts, &id, &init, BPF_NOEXIST);
+	if (!err) {
+		__sync_fetch_and_add(&cms_exact_inserts, 1);
+		return;
+	}
 	if (err) {
 		/* Lost the race: someone else just created it. Their insert
 		 * already counts as one increment; add ours to it instead of

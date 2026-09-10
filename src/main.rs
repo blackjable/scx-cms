@@ -297,6 +297,12 @@ impl<'a> Scheduler<'a> {
             bss.cms_boosts_applied,
         );
 
+        info!(
+            "  identities: distinct_inserts={} (sample twice and divide by \
+             the interval for new identities per second)",
+            bss.cms_exact_inserts,
+        );
+
         if !self.compare {
             return;
         }
