@@ -158,6 +158,20 @@ struct Opts {
     #[clap(long, default_value_t = 16384)]
     max_tracked: u32,
 
+    /// Back the exact tracker with a plain hash instead of an LRU hash.
+    /// Control for whether small-map degradation is LRU behaviour or
+    /// genuine capacity.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    plain_map: bool,
+
+    /// Apply a final avalanche to the sketch hash before the modulo.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    hash_mix: bool,
+
+    /// Use conservative update (Estan & Varghese) for sketch increments.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    conservative: bool,
+
     /// Cap on any single vtime adjustment, in ns.
     #[clap(long, default_value_t = 20_000_000)]
     adjust_max_ns: u64,
@@ -212,6 +226,7 @@ impl<'a> Scheduler<'a> {
         // identities in a 1s window would need process lifetimes under
         // 4ms, which fork cannot deliver.
         skel.maps.cms_counts.set_max_entries(opts.max_tracked)?;
+        skel.maps.cms_counts_plain.set_max_entries(opts.max_tracked)?;
 
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         rodata.cms_tracker = opts.tracker.as_bpf_const();
@@ -227,6 +242,9 @@ impl<'a> Scheduler<'a> {
         rodata.cms_boost_ns = opts.boost_ns;
         rodata.cms_boost_thresh = opts.boost_threshold;
         rodata.cms_flat_ns = opts.flat_ns;
+        rodata.cms_plain_map = opts.plain_map;
+        rodata.cms_hash_mix = opts.hash_mix;
+        rodata.cms_conservative = opts.conservative;
         rodata.cms_adjust_max_ns = opts.adjust_max_ns;
 
         let mut skel = scx_ops_load!(skel, cms_ops, uei)?;
@@ -330,6 +348,13 @@ impl<'a> Scheduler<'a> {
             exact as f64 / samples as f64,
             sketch as f64 / samples as f64,
             bss.cms_cmp_max_over,
+        );
+
+        let h = &bss.cms_cmp_hist;
+        info!(
+            "  exact-count distribution: zero={} 1-9={} 10-99={} 100-999={} \
+             1k-10k={} 10k+={}",
+            h[0], h[1], h[2], h[3], h[4], h[5],
         );
 
         // Count-Min must never undercount. A non-zero value here means the

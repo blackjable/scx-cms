@@ -35,6 +35,43 @@ struct {
 } cms_counts SEC(".maps");
 
 /*
+ * The same tracker backed by a plain hash, which does not evict: once
+ * full, inserts fail and new identities are simply untracked.
+ *
+ * This exists as a control. The finding that exact counting degrades at
+ * small entry counts was explained by LRU behaviour, and that explanation
+ * was never tested. BPF's LRU keeps per-CPU free lists targeting
+ * LOCAL_FREE_TARGET (128) entries each, so a map sized in the tens or
+ * low hundreds on a multi-core system is smaller than the machinery
+ * managing it, and its behaviour may be dominated by the implementation
+ * rather than by LRU semantics. Same capacity, different eviction policy:
+ * if the degradation persists it is capacity, if it vanishes it was the
+ * LRU.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, CMS_MAX_TRACKED);
+	__type(key, u64);
+	__type(value, struct cms_count);
+} cms_counts_plain SEC(".maps");
+
+const volatile bool cms_plain_map;
+
+static __always_inline void *cms_counts_lookup(u64 *id)
+{
+	if (cms_plain_map)
+		return bpf_map_lookup_elem(&cms_counts_plain, id);
+	return bpf_map_lookup_elem(&cms_counts, id);
+}
+
+static __always_inline long cms_counts_insert(u64 *id, struct cms_count *v)
+{
+	if (cms_plain_map)
+		return bpf_map_update_elem(&cms_counts_plain, id, v, BPF_NOEXIST);
+	return bpf_map_update_elem(&cms_counts, id, v, BPF_NOEXIST);
+}
+
+/*
  * Bring an entry up to date with the current epoch, applying however many
  * rotations it slept through. One window missed means this window's counts
  * became last window's; two or more means both buffers are stale.
@@ -75,7 +112,7 @@ static __always_inline void cms_exact_increment(u64 id)
 	u64 epoch = cms_epoch;
 	long err;
 
-	c = bpf_map_lookup_elem(&cms_counts, &id);
+	c = cms_counts_lookup(&id);
 	if (c) {
 		cms_roll(c, epoch);
 		__sync_fetch_and_add(&c->cur, 1);
@@ -99,7 +136,7 @@ static __always_inline void cms_exact_increment(u64 id)
 	__builtin_memset(&init, 0, sizeof(init));
 	init.epoch = epoch;
 	init.cur = 1;
-	err = bpf_map_update_elem(&cms_counts, &id, &init, BPF_NOEXIST);
+	err = cms_counts_insert(&id, &init);
 	if (!err) {
 		__sync_fetch_and_add(&cms_exact_inserts, 1);
 		return;
@@ -108,7 +145,7 @@ static __always_inline void cms_exact_increment(u64 id)
 		/* Lost the race: someone else just created it. Their insert
 		 * already counts as one increment; add ours to it instead of
 		 * silently dropping it. */
-		c = bpf_map_lookup_elem(&cms_counts, &id);
+		c = cms_counts_lookup(&id);
 		if (c) {
 			cms_roll(c, epoch);
 			__sync_fetch_and_add(&c->cur, 1);
@@ -131,7 +168,7 @@ static __always_inline u64 cms_exact_query(u64 id)
 {
 	struct cms_count *c;
 
-	c = bpf_map_lookup_elem(&cms_counts, &id);
+	c = cms_counts_lookup(&id);
 	if (!c)
 		return 0;
 

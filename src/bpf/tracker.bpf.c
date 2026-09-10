@@ -90,6 +90,18 @@ u64 cms_cmp_max_over;
  */
 u64 cms_cmp_underestimates;
 
+/*
+ * Distribution of the exact count seen per query, not just its mean.
+ *
+ * The churning workload reports a mean tracked count of ~220 where the
+ * workload model predicts ~64, a gap the measured identity population did
+ * not close. A mean cannot distinguish "most queries see 220" from "most
+ * see almost nothing and a few see thousands", and those imply different
+ * things about what the tracker is actually holding. Buckets answer that
+ * directly instead of supporting another inference.
+ */
+u64 cms_cmp_hist[6];
+
 /* Diagnostic-only: latches the first violation's raw state globally,
  * since the per-pid probe only sees one task's wakeups and the
  * violations are happening across many tasks under compare mode. */
@@ -152,6 +164,16 @@ static __always_inline void cms_compare_sample(u64 id)
 		return;
 
 	__sync_fetch_and_add(&cms_cmp_samples, 1);
+
+	{
+		u32 b = exact == 0 ? 0 :
+			exact < 10 ? 1 :
+			exact < 100 ? 2 :
+			exact < 1000 ? 3 :
+			exact < 10000 ? 4 : 5;
+
+		__sync_fetch_and_add(&cms_cmp_hist[b], 1);
+	}
 	__sync_fetch_and_add(&cms_cmp_exact_sum, exact);
 	__sync_fetch_and_add(&cms_cmp_sketch_sum, sketch);
 
@@ -185,15 +207,22 @@ static __always_inline void cms_track(u64 id)
 {
 	if (cms_compare) {
 		cms_exact_increment(id);
-		cms_sketch_increment(id);
+		if (cms_conservative)
+			cms_sketch_increment_cu(id);
+		else
+			cms_sketch_increment(id);
 		cms_compare_sample(id);
 		return;
 	}
 
-	if (cms_tracker == CMS_TRACKER_SKETCH)
-		cms_sketch_increment(id);
-	else
+	if (cms_tracker == CMS_TRACKER_SKETCH) {
+		if (cms_conservative)
+			cms_sketch_increment_cu(id);
+		else
+			cms_sketch_increment(id);
+	} else {
 		cms_exact_increment(id);
+	}
 }
 
 static __always_inline u64 cms_query(u64 id)
