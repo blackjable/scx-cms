@@ -32,6 +32,7 @@
 #include "none.bpf.c"
 #include "penalty.bpf.c"
 #include "boost.bpf.c"
+#include "flat.bpf.c"
 
 /*
  *       id  name      implementation
@@ -39,4 +40,5 @@
 #define CMS_MECHANISM_LIST(X)				\
 	X(0,  none,     cms_mech_none)			\
 	X(1,  penalty,  cms_mech_penalty)		\
-	X(2,  boost,    cms_mech_boost)
+	X(2,  boost,    cms_mech_boost)		\
+	X(3,  flat,     cms_mech_flat)

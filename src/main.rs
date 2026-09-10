@@ -148,6 +148,16 @@ struct Opts {
     #[clap(long, default_value_t = 8)]
     boost_threshold: u64,
 
+    /// Flat per-enqueue vtime penalty ignoring the tracked count
+    /// (--mechanism flat). Negative control for the penalty result.
+    #[clap(long, default_value_t = 0)]
+    flat_ns: u64,
+
+    /// Entries in the exact tracker's hash. The exact tracker's memory
+    /// budget, and the knob that makes it comparable against the sketch's.
+    #[clap(long, default_value_t = 16384)]
+    max_tracked: u32,
+
     /// Cap on any single vtime adjustment, in ns.
     #[clap(long, default_value_t = 20_000_000)]
     adjust_max_ns: u64,
@@ -188,6 +198,21 @@ impl<'a> Scheduler<'a> {
         let cells = 2 * opts.sketch_width * opts.sketch_depth;
         skel.maps.cms_sketch.set_max_entries(cells)?;
 
+        // Size the exact tracker's hash the same way, for the same reason.
+        // Both maps exist in the BPF object whichever tracker is selected,
+        // so a memory comparison that leaves this at its compile-time
+        // ceiling measures the ceiling, not the tracker -- and the two
+        // conditions come out byte-identical, which is exactly what the
+        // first attempt at the round 3 sweep reported.
+        //
+        // Sizing it explicitly also makes the real experiment possible:
+        // give exact and sketch matched budgets, shrink both, and see
+        // which degrades first. Overwhelming a fixed-size exact map by
+        // identity count alone is not reachable here -- exceeding 16,384
+        // identities in a 1s window would need process lifetimes under
+        // 4ms, which fork cannot deliver.
+        skel.maps.cms_counts.set_max_entries(opts.max_tracked)?;
+
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         rodata.cms_tracker = opts.tracker.as_bpf_const();
         rodata.cms_sketch_width = opts.sketch_width;
@@ -201,6 +226,7 @@ impl<'a> Scheduler<'a> {
         rodata.cms_penalty_ns = opts.penalty_ns;
         rodata.cms_boost_ns = opts.boost_ns;
         rodata.cms_boost_thresh = opts.boost_threshold;
+        rodata.cms_flat_ns = opts.flat_ns;
         rodata.cms_adjust_max_ns = opts.adjust_max_ns;
 
         let mut skel = scx_ops_load!(skel, cms_ops, uei)?;
