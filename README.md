@@ -1,53 +1,107 @@
 # scx_cms
 
-`scx_cms` is `scx_simple`'s scheduling policy (global weighted-vtime, with
-an optional FIFO mode) unmodified, plus a swappable per-task identity
-abstraction (`src/bpf/identity.bpf.c`) wired into the `runnable` and
-`quiescent` callbacks.
+An experimental `sched_ext` scheduler that tracks per-task wakeup
+frequency and acts on it, built to answer one question: **can a
+Count-Min Sketch replace exact per-task counters, saving memory without
+hurting scheduling quality?**
 
-## Status
+Short answer: yes, with a cost. A sketch at 8.3 KB does what exact
+counting needs 35.6 KB for — identical typical latency, a worse and
+noisier tail. Full results, data and a rather long list of retractions
+live in the research repo (see below).
 
-This is the **exact-counter tier** of the study described in
-`.claude/sched_ext_phase2_handoff/` at the repo root — see that folder's
-`MANIFEST.md` for the full research history and design rationale before
-changing anything here. The Count-Min Sketch tracker it will be compared
-against does not exist yet.
+## What it is
 
-What exists today:
+`scx_simple`'s scheduling policy (global weighted-vtime, optional FIFO)
+unmodified, plus three things made swappable at **load time** rather
+than compile time, so that comparisons hold everything else constant:
 
-- `task_identity()` resolves a task to a PID, TGID, or FNV-1a hash of
-  `comm`, selectable via `--identity-key` (default: `pid`). Which of the
-  three to actually use is an open, evidence-based decision — not resolved
-  here on purpose (see the delivery plan's Section 2: `comm` is
-  self-settable by a task, which matters once a hash-collision attack
-  against the tracker is a demonstrated risk).
-- An exact per-identity wakeup counter with rotating dual-buffer windowing
-  (`tracker.bpf.c`), porting the scheme validated in Phase 1 — a query sums
-  the current and previous window, older data is discarded. Window length
-  is set by `--window-ms`.
-- A swappable mechanism (`mechanism.bpf.c`) turning that count into a
-  scheduling decision: `--mechanism none|penalty|boost`. **Neither penalty
-  nor boost is validated.** Phase 1 found no measurable sketch-vs-exact
-  difference under penalty, and never successfully tested an oracle-free
-  boost at all; `boost` here is a first attempt awaiting evaluation, not a
-  port of something known to work.
-- No sketch and no adversarial mitigation yet — those come from
-  `.claude/sched_ext_phase2_handoff/02_validated_python_code/` in a later
-  step.
+| axis | flag | options |
+|---|---|---|
+| how counts are stored | `--tracker` | `exact` (LRU hash), `sketch` (Count-Min) |
+| what a "task" is | `--identity-key` | `pid`, `tgid`, `comm` |
+| what the count does | `--mechanism` | `none`, `penalty`, `boost`, `flat` |
 
-## Usage
+Both trackers are compiled in and the verifier eliminates the unselected
+branch, so switching `--tracker` changes the counting method and nothing
+else. That property is what makes the central comparison meaningful.
+
+`--mechanism flat` is the count-blind control: it applies the same vtime
+perturbation while ignoring the tracked count entirely. It exists because
+comparing `penalty` against `none` conflates *consulting the count* with
+*perturbing scheduling at all* — and when that control was finally built,
+it reproduced about 82% of what had looked like a 6.8x win for tracking.
+
+## Building
+
+**This repository is not standalone.** `Cargo.toml` depends on
+`scx_utils` and `scx_cargo` by relative path, and the BPF build uses
+scx's tooling. Drop it into an scx checkout:
 
 ```
-scx_cms [--fifo] [--identity-key pid|tgid|comm]
-        [--mechanism none|penalty|boost] [--window-ms MS]
-        [--penalty-ns N] [--boost-ns N] [--boost-threshold N]
-        [--adjust-max-ns N] [--stats INTERVAL] [-d|--debug]
+git clone https://github.com/sched-ext/scx.git
+git clone <this repo> scx/scheds/experimental/scx_cms
+cd scx && cargo build -p scx_cms
 ```
 
-Note that `--mechanism none` leaves scheduling behaviour identical to
-`scx_simple` while still tracking, which is what isolates tracking
-overhead from mechanism effect.
+Developed against scx as of September 2026, kernel 6.19, aarch64. The
+`sched_ext` support it needs landed in 6.12.
 
-`--fifo` and the rest of the scheduling behavior are unchanged from
-`scx_simple`; see its original doc comment in `src/bpf/main.bpf.c` for
-the policy description.
+## Notable flags
+
+```
+--tracker exact|sketch        counting method (the study's variable)
+--sketch-width N              columns per row (depth 2 outperformed the
+--sketch-depth N              default depth 4 by 1.8x at equal memory)
+--max-tracked N               exact tracker's entry count
+--mechanism none|penalty|boost|flat
+--identity-key pid|tgid|comm
+--compare                     run BOTH trackers over the same wakeups and
+                              report divergence, max overshoot, and any
+                              never-undercount violations
+--plain-map                   back the exact tracker with a plain hash
+                              instead of an LRU (see below)
+--hash-mix                    extra avalanche before the modulo
+--conservative                conservative update (see caveat below)
+--stats N                     periodic counters, including mechanism reach
+```
+
+## Two findings about BPF, not about sketches
+
+**`LRU_HASH` stops behaving like an LRU when it is small.** At 42 entries
+on a 4-CPU machine it reported a mean tracked count of 1.6 where a plain
+hash of identical capacity reported 189.8 — roughly 30x worse than LRU
+semantics predict. BPF's per-CPU free lists are larger than the map. The
+`--plain-map` flag exists to demonstrate this. The threshold scales with
+CPU count, so do not quote 42 as a general number.
+
+**Conservative update cannot be implemented safely here.** It requires
+reading all *d* cells, taking the minimum and writing back atomically;
+each cell needs its own `bpf_map_lookup_elem`; and the verifier rejects
+a lock held across those calls with *"function calls are not allowed
+while holding a lock"*. The `--conservative` implementation is therefore
+lock-free and **races observably** — it produced 1,749 never-undercount
+violations against a baseline of 116. It is included so the measurement
+can be reproduced, not because it is usable.
+
+## Known open issues
+
+- **Increment-then-read is not atomic as a unit.** The regression suite
+  in `tests/` carries this as an expected failure. Phase 6 measurements
+  deliberately used distinct churn identities to keep this bug out of the
+  results, which means the same-identity concurrent path is not exercised
+  by any of them.
+- `--conservative` is unsound, as above.
+
+## Results, data, and what was retracted
+
+The research repository holds the paper draft, the benchmark harnesses,
+the raw output of every run, and a record of ten claims that were made
+and then withdrawn — each tied to the file that produced it and the file
+that overturned it.
+
+The retractions are worth reading before trusting any number here. Nine
+of ten were caused by a faulty instrument rather than a faulty
+hypothesis, and the controls that eventually caught them (a do-nothing
+reference condition, a count-blind control, randomised condition
+ordering) are all reproducible with the flags above.
