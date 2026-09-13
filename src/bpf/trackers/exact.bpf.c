@@ -39,14 +39,28 @@ struct {
  * full, inserts fail and new identities are simply untracked.
  *
  * This exists as a control. The finding that exact counting degrades at
- * small entry counts was explained by LRU behaviour, and that explanation
- * was never tested. BPF's LRU keeps per-CPU free lists targeting
- * LOCAL_FREE_TARGET (128) entries each, so a map sized in the tens or
- * low hundreds on a multi-core system is smaller than the machinery
- * managing it, and its behaviour may be dominated by the implementation
- * rather than by LRU semantics. Same capacity, different eviction policy:
- * if the degradation persists it is capacity, if it vanishes it was the
- * LRU.
+ * small entry counts was explained by BPF-specific LRU behaviour -- the
+ * per-CPU free lists targeting LOCAL_FREE_TARGET (128) entries each,
+ * making a map sized in the tens smaller than the machinery managing it
+ * -- and that explanation was never tested. Same capacity, different
+ * eviction policy: if the degradation persists it is capacity, if it
+ * vanishes it was the LRU.
+ *
+ * ANSWERED, and not in favour of the explanation that motivated this
+ * map. Holding capacity at 42 entries and varying the identity
+ * population instead shows the LRU retaining counts perfectly well at 8
+ * and 20 identities (781.2 and 456.2 mean) and collapsing only at 100
+ * and 300. Were the free lists responsible it would fail at 42 entries
+ * regardless of the population. The collapse tracks OVERCOMMITMENT, not
+ * map size, which is what any LRU does below its working set. See
+ * REVISIONS.md revision 12 in the research repository.
+ *
+ * The control earned its place anyway. The two map types degrade into
+ * different shapes -- LRU thrashes uniformly so every query reads near
+ * 1, while a plain hash locks in early arrivals and lets those reach
+ * ~200 while 83% of queries read zero -- and that difference is what
+ * distinguishes a tracker that has stopped working from one that is
+ * working on genuinely quiet tasks.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);

@@ -68,12 +68,26 @@ Developed against scx as of September 2026, kernel 6.19, aarch64. The
 
 ## Two findings about BPF, not about sketches
 
-**`LRU_HASH` stops behaving like an LRU when it is small.** At 42 entries
-on a 4-CPU machine it reported a mean tracked count of 1.6 where a plain
-hash of identical capacity reported 189.8 — roughly 30x worse than LRU
-semantics predict. BPF's per-CPU free lists are larger than the map. The
-`--plain-map` flag exists to demonstrate this. The threshold scales with
-CPU count, so do not quote 42 as a general number.
+**Bounded maps fail in different shapes, and only one failure is
+legible.** Under overcommitment an `LRU_HASH` thrashes uniformly —
+nothing accumulates, every query reads near 1 — while a plain
+`BPF_MAP_TYPE_HASH` of identical capacity locks in whichever keys
+arrived first, letting those reach ~200 while 83% of queries return
+zero. Neither is usable below its working set, but a zero from the plain
+hash means *not tracked*, where a low count from the LRU could equally
+mean an idle task. That difference is what `--plain-map` exists for: it
+is how you tell a tracker that has stopped working from one that is
+working on quiet tasks.
+
+> **Retracted:** an earlier version of this section claimed `LRU_HASH`
+> stops behaving like an LRU when the map is small, and blamed BPF's
+> per-CPU free lists. The measurements were right and the mechanism was
+> invented. A 42-entry LRU retains counts normally with 8 or 20
+> identities (781.2 and 456.2) and collapses only at 100 or 300, so the
+> failure tracks *overcommitment* rather than map size — which is what
+> any LRU does below its working set, and not news about BPF. The
+> withdrawn prediction that the threshold scales with CPU count goes
+> with it. See `REVISIONS.md` revision 12 in the research repository.
 
 **Conservative update cannot be implemented safely here.** It requires
 reading all *d* cells, taking the minimum and writing back atomically;
@@ -96,12 +110,14 @@ can be reproduced, not because it is usable.
 ## Results, data, and what was retracted
 
 The research repository holds the paper draft, the benchmark harnesses,
-the raw output of every run, and a record of ten claims that were made
+the raw output of every run, and a record of twelve claims that were made
 and then withdrawn — each tied to the file that produced it and the file
 that overturned it.
 
 The retractions are worth reading before trusting any number here. Nine
-of ten were caused by a faulty instrument rather than a faulty
+of the twelve were caused by a faulty instrument rather than a faulty
 hypothesis, and the controls that eventually caught them (a do-nothing
 reference condition, a count-blind control, randomised condition
-ordering) are all reproducible with the flags above.
+ordering) are all reproducible with the flags above. Three were
+different: the measurements were correct and an untested mechanism was
+attached to them — including the one retracted above, in this file.
