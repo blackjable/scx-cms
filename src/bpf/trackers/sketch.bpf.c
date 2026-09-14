@@ -208,7 +208,7 @@ static __always_inline void cms_sketch_increment_cu(u64 id)
 	}
 }
 
-static __always_inline void cms_sketch_increment(u64 id)
+static __always_inline void cms_sketch_increment_plain(u64 id)
 {
 	u32 buf = cms_sketch_cur & 1;
 	u32 row;
@@ -224,6 +224,21 @@ static __always_inline void cms_sketch_increment(u64 id)
 		if (cell)
 			__sync_fetch_and_add(cell, 1);
 	}
+}
+
+/*
+ * The uniform entry point the tracker registry dispatches to. Conservative
+ * update is a variant of this tracker rather than a tracker of its own --
+ * same table, same geometry, same memory -- so the choice belongs here
+ * rather than in the dispatcher, which would otherwise need a special case
+ * no other tracker has.
+ */
+static __always_inline void cms_sketch_increment(u64 id)
+{
+	if (cms_conservative)
+		cms_sketch_increment_cu(id);
+	else
+		cms_sketch_increment_plain(id);
 }
 
 /*
@@ -310,7 +325,7 @@ static __always_inline void cms_sketch_rotate(void)
 	__sync_fetch_and_add(&cms_sketch_seq, 1); /* now even: rotation done */
 }
 
-static __always_inline void cms_sketch_init(void)
+static __always_inline s32 cms_sketch_init(void)
 {
 	u32 row;
 
@@ -321,4 +336,6 @@ static __always_inline void cms_sketch_init(void)
 		cms_sketch_seed_row(0, row);
 		cms_sketch_seed_row(1, row);
 	}
+
+	return 0;
 }

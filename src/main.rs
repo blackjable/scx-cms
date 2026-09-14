@@ -66,26 +66,8 @@ impl IdentityKey {
 // src/bpf/mechanisms/index.h so the command line cannot drift from what is
 // actually compiled into the scheduler. Register new mechanisms there.
 include!(concat!(env!("OUT_DIR"), "/mechanisms.rs"));
+include!(concat!(env!("OUT_DIR"), "/trackers.rs"));
 
-/// Which counting method backs the tracker. Hand-written rather than
-/// generated, unlike Mechanism: this is a fixed pair, not an extensible set.
-/// Must match `enum cms_tracker_kind` in src/bpf/intf.h.
-#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
-enum Tracker {
-    /// Exact per-identity counts; memory grows with distinct tasks.
-    Exact,
-    /// Count-Min Sketch; fixed memory, approximate and never underestimates.
-    Sketch,
-}
-
-impl Tracker {
-    fn as_bpf_const(self) -> u32 {
-        match self {
-            Tracker::Exact => 0,
-            Tracker::Sketch => 1,
-        }
-    }
-}
 
 #[derive(Debug, Parser)]
 #[command(name = SCHEDULER_NAME, version, disable_version_flag = true)]
@@ -108,8 +90,21 @@ struct Opts {
     /// Which counting method backs the tracker. `exact` grows with the
     /// number of distinct tasks; `sketch` is fixed size but approximate.
     /// This is the study's independent variable.
+    ///
+    /// `test_null` and `test_saturate` are controls, not counting methods:
+    /// they always answer 0 and always answer a saturating value, so
+    /// `test_null --mechanism penalty` must behave exactly like
+    /// `--mechanism none`, and `test_saturate --mechanism penalty` exactly
+    /// like `--mechanism flat` at or above the adjustment clamp. Do not
+    /// report a measurement from either.
     #[clap(long, value_enum, default_value = "exact")]
     tracker: Tracker,
+
+    /// Which tracker `--compare` measures against exact counting. Defaults
+    /// to the sketch, which is what this mode did unconditionally before it
+    /// was selectable. Only meaningful with --compare.
+    #[clap(long, value_enum, default_value = "sketch")]
+    compare_with: Tracker,
 
     /// Sketch columns per row (--tracker sketch). Wider is more accurate.
     #[clap(long, default_value_t = 256)]
@@ -234,6 +229,7 @@ impl<'a> Scheduler<'a> {
         rodata.cms_sketch_depth = opts.sketch_depth;
         rodata.cms_seed_rotation = opts.seed_rotation;
         rodata.cms_compare = opts.compare;
+        rodata.cms_compare_with = opts.compare_with.as_bpf_const();
         rodata.fifo_sched = opts.fifo;
         rodata.cms_identity_key = opts.identity_key.as_bpf_const();
         rodata.cms_mechanism = opts.mechanism.as_bpf_const();
@@ -450,8 +446,18 @@ fn main() -> Result<()> {
             opts.seed_rotation,
             2 * opts.sketch_width * opts.sketch_depth * 4,
         );
-    } else {
+    } else if opts.tracker == Tracker::Exact {
         info!("Tracker: exact (memory grows with distinct identities)");
+    } else {
+        // A control, not a counting method. Say so loudly in the log: this
+        // line previously fell through to "exact" for anything that was not
+        // the sketch, so a run with a test tracker would have been recorded
+        // as an exact-counting run by anyone reading the output.
+        warn!(
+            "Tracker: {:?} -- this is a CONTROL, not a counting method. \
+             Do not report a measurement from this run.",
+            opts.tracker
+        );
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));

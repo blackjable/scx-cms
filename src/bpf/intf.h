@@ -47,10 +47,20 @@ enum cms_identity_key {
 /*
  * Which counting method backs the wakeup tracker. This is the study's
  * independent variable -- the whole question is whether the approximate
- * one can replace the exact one -- so unlike mechanisms it is a fixed
- * pair rather than an extensible set, and is registered by hand.
+ * one can replace the exact one.
+ *
+ * Registration lives in trackers/index.h (CMS_TRACKER_LIST), which
+ * build.rs validates and generates the --tracker values from. Only the two
+ * ids referenced from C appear below -- the default for `cms_tracker` and
+ * the default for `cms_compare_with` -- so this is not a second place to
+ * register a tracker and forget.
  */
 enum cms_tracker_kind {
+	/* Kept in step with CMS_TRACKER_LIST in trackers/index.h. Only the
+	 * two values referenced from C need to be here: the default for
+	 * `cms_tracker` and the default for `cms_compare_with`. The
+	 * --tracker command-line values are generated from that list by
+	 * build.rs, so this is not a second registration point. */
 	CMS_TRACKER_EXACT	= 0,
 	CMS_TRACKER_SKETCH	= 1,
 };

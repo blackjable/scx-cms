@@ -3,20 +3,22 @@
  * Wakeup tracking: the shared window clock, and the choice of counting
  * method.
  *
- * Two backends live in trackers/, and --tracker picks between them at
- * launch. They are the study's independent variable: exact counting is
- * correct but grows with the number of distinct tasks, the sketch is fixed
- * in size but approximate, and the question is whether that approximation
- * ever changes a scheduling decision.
+ * The backends live in trackers/ and register themselves in
+ * trackers/index.h; --tracker picks between them at launch. They are the
+ * study's independent variable: exact counting is correct but grows with
+ * the number of distinct tasks, the sketch is fixed in size but
+ * approximate, and the question is whether that approximation ever changes
+ * a scheduling decision.
  *
- * Unlike mechanisms/, this is a hand-registered pair rather than an
- * extensible set. Adding a third counting method is not anticipated -- the
- * comparison is the experiment -- so the registration machinery that folder
- * carries would not pay for itself here.
- *
- * Both backends share one window clock, driven by the timer below, so a
+ * Every backend shares one window clock, driven by the timer below, so a
  * comparison between them cannot be confounded by differing window
  * boundaries.
+ *
+ * This was a hand-written if/else over a fixed pair, with a comment saying
+ * a third counting method was not anticipated. It is a registered list now,
+ * sharing build.rs's validation with mechanisms/, because two branches
+ * cannot distinguish a dispatch that works from one that routes everything
+ * to the same place -- see trackers/test_null.bpf.c.
  */
 
 const volatile u32 cms_tracker = CMS_TRACKER_EXACT;
@@ -26,8 +28,73 @@ const volatile u64 cms_window_ns = CMS_DFL_WINDOW_NS;
 u64 cms_epoch;
 u64 cms_window_rotations;
 
-#include "trackers/exact.bpf.c"
-#include "trackers/sketch.bpf.c"
+#include "trackers/index.h"
+
+/*
+ * Dispatch, generated from CMS_TRACKER_LIST so that adding a tracker means
+ * editing one list rather than finding every switch site. `which` is always
+ * a load-time constant (`cms_tracker` or `cms_compare_with`), so the
+ * verifier folds these chains to the selected body and eliminates the rest
+ * -- the same property the original if/else relied on.
+ */
+static __always_inline void cms_increment_as(u32 which, u64 id)
+{
+#define X(id_, name_, pfx_, uc_)					\
+	if (which == id_) {						\
+		pfx_##_increment(id);					\
+		return;							\
+	}
+	CMS_TRACKER_LIST(X)
+#undef X
+}
+
+static __always_inline u64 cms_query_as(u32 which, u64 id)
+{
+#define X(id_, name_, pfx_, uc_)					\
+	if (which == id_)						\
+		return pfx_##_query(id);
+	CMS_TRACKER_LIST(X)
+#undef X
+	return 0;
+}
+
+static __always_inline void cms_rotate_as(u32 which)
+{
+#define X(id_, name_, pfx_, uc_)					\
+	if (which == id_) {						\
+		pfx_##_rotate();					\
+		return;							\
+	}
+	CMS_TRACKER_LIST(X)
+#undef X
+}
+
+static __always_inline s32 cms_init_as(u32 which)
+{
+#define X(id_, name_, pfx_, uc_)					\
+	if (which == id_)						\
+		return pfx_##_init();
+	CMS_TRACKER_LIST(X)
+#undef X
+	return 0;
+}
+
+/*
+ * Does the tracker at `which` promise never to report less than the true
+ * count? Declared per row in trackers/index.h. Compare mode's violation
+ * counter is only meaningful for a tracker that claims this; for one that
+ * can legitimately undercount, a non-zero count is expected behaviour and
+ * counting it as a fault would bury the real signal.
+ */
+static __always_inline bool cms_never_undercounts(u32 which)
+{
+#define X(id_, name_, pfx_, uc_)					\
+	if (which == id_)						\
+		return uc_;
+	CMS_TRACKER_LIST(X)
+#undef X
+	return false;
+}
 
 /*
  * Compare mode: feed BOTH counters every wakeup and record how far apart
@@ -46,8 +113,23 @@ u64 cms_window_rotations;
  */
 const volatile bool cms_compare;
 
+/*
+ * Which tracker compare mode measures AGAINST exact counting. Defaults to
+ * the sketch, which is what every harness in this project asks for and what
+ * this mode did unconditionally before it was selectable -- so existing
+ * invocations are unchanged.
+ *
+ * It is separate from --tracker on purpose: the harnesses run compare mode
+ * with `--tracker exact --mechanism none`, measuring accuracy while exact
+ * counting drives scheduling, so that the thing being measured is not also
+ * perturbing the workload it is measured on.
+ */
+const volatile u32 cms_compare_with = CMS_TRACKER_SKETCH;
+
 u64 cms_cmp_samples;
 u64 cms_cmp_exact_sum;
+/* Named for the sketch because that is what it measured for the whole
+ * study; it now holds whichever tracker --compare-with selects. */
 u64 cms_cmp_sketch_sum;
 u64 cms_cmp_max_over;
 
@@ -147,7 +229,7 @@ static __always_inline bool cms_query_both(u64 id, u64 *exact, u64 *sketch)
 		u64 seq_before = cms_sketch_seq;
 
 		*exact = cms_exact_query(id);
-		*sketch = cms_sketch_query(id);
+		*sketch = cms_query_as(cms_compare_with, id);
 
 		if (seq_before == cms_sketch_seq && (seq_before & 1) == 0)
 			return true;
@@ -177,7 +259,7 @@ static __always_inline void cms_compare_sample(u64 id)
 	__sync_fetch_and_add(&cms_cmp_exact_sum, exact);
 	__sync_fetch_and_add(&cms_cmp_sketch_sum, sketch);
 
-	if (sketch < exact) {
+	if (sketch < exact && cms_never_undercounts(cms_compare_with)) {
 		__sync_fetch_and_add(&cms_cmp_underestimates, 1);
 
 		if (!diag_viol_seen) {
@@ -207,30 +289,18 @@ static __always_inline void cms_track(u64 id)
 {
 	if (cms_compare) {
 		cms_exact_increment(id);
-		if (cms_conservative)
-			cms_sketch_increment_cu(id);
-		else
-			cms_sketch_increment(id);
+		if (cms_compare_with != CMS_TRACKER_EXACT)
+			cms_increment_as(cms_compare_with, id);
 		cms_compare_sample(id);
 		return;
 	}
 
-	if (cms_tracker == CMS_TRACKER_SKETCH) {
-		if (cms_conservative)
-			cms_sketch_increment_cu(id);
-		else
-			cms_sketch_increment(id);
-	} else {
-		cms_exact_increment(id);
-	}
+	cms_increment_as(cms_tracker, id);
 }
 
 static __always_inline u64 cms_query(u64 id)
 {
-	if (cms_tracker == CMS_TRACKER_SKETCH)
-		return cms_sketch_query(id);
-
-	return cms_exact_query(id);
+	return cms_query_as(cms_tracker, id);
 }
 
 struct cms_window_timer {
@@ -256,8 +326,9 @@ static int cms_window_timer_cb(void *map, int *key, struct bpf_timer *timer)
 	__sync_fetch_and_add(&cms_epoch, 1);
 	__sync_fetch_and_add(&cms_window_rotations, 1);
 
-	if (cms_tracker == CMS_TRACKER_SKETCH || cms_compare)
-		cms_sketch_rotate();
+	cms_rotate_as(cms_tracker);
+	if (cms_compare && cms_compare_with != cms_tracker)
+		cms_rotate_as(cms_compare_with);
 
 	err = bpf_timer_start(timer, cms_window_ns, 0);
 	if (err)
@@ -272,8 +343,14 @@ static s32 cms_tracker_init(void)
 	u32 key = 0;
 	int err;
 
-	if (cms_tracker == CMS_TRACKER_SKETCH || cms_compare)
-		cms_sketch_init();
+	err = cms_init_as(cms_tracker);
+	if (err)
+		return err;
+	if (cms_compare && cms_compare_with != cms_tracker) {
+		err = cms_init_as(cms_compare_with);
+		if (err)
+			return err;
+	}
 
 	timer = bpf_map_lookup_elem(&cms_window_timer, &key);
 	if (!timer) {

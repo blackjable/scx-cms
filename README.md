@@ -95,9 +95,12 @@ reading all *d* cells, taking the minimum and writing back atomically;
 each cell needs its own `bpf_map_lookup_elem`; and the verifier rejects
 a lock held across those calls with *"function calls are not allowed
 while holding a lock"*. The `--conservative` implementation is therefore
-lock-free and **races observably** — it produced 1,749 never-undercount
-violations against a baseline of 116. It is included so the measurement
-can be reproduced, not because it is usable.
+lock-free and **races observably**, producing thousands of
+never-undercount violations in every run. No rate is quoted because none
+replicates: the same configuration gave 1,749 and then 1,036, and a
+neighbouring variant moved 197 to 1,750. One violation is enough — that
+guarantee is the reason to choose this structure. Included so the
+measurement can be reproduced, not because it is usable.
 
 ## Known open issues
 

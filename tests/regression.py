@@ -277,11 +277,119 @@ def test_known_roll_race(binary: str, workers: int, windows: int) -> tuple:
         return PASS, "0 violations"
 
 
+def test_null_tracker_is_inert(binary: str) -> tuple:
+    """A tracker that always answers 0 must make `penalty` a no-op.
+
+    This is an exact prediction, not a statistical one. cms_mech_penalty
+    computes `adj = count * cms_penalty_ns` and returns vtime unchanged when
+    adj is zero, without touching cms_penalties_applied. So over any run of
+    any length the counter must read exactly 0.
+
+    It is also the dispatch test. If --tracker test_null were routed to any
+    real tracker -- the obvious failure mode when the tracker axis became a
+    registered list rather than a hand-written if/else -- the count would be
+    non-zero and this fails. A two-tracker dispatch could not catch that,
+    because every mis-route still landed on something that produced
+    plausible numbers.
+    """
+    with Scheduler(binary, "--tracker", "test_null", "--mechanism", "penalty",
+                   "--penalty-ns", "1000000", "--stats", "60"):
+        pids = [spawn(f"nulltest{i}", 400) for i in range(8)]
+        time.sleep(2.0)
+        b = read_bss()
+        for pid in pids:
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+
+    applied = int(b.get("cms_penalties_applied", -1))
+    if applied < 0:
+        return FAIL, "cms_penalties_applied missing from .bss"
+    runnable = int(b.get("runnable_events", 0))
+    if runnable == 0:
+        return FAIL, "no wakeups observed -- test did not exercise the path"
+    if applied != 0:
+        return FAIL, (f"penalty applied {applied} times with a tracker that "
+                      f"always reports 0 -- dispatch is not selecting test_null")
+    return PASS, f"0 penalties over {runnable} wakeups"
+
+
+def test_saturate_tracker_clamps(binary: str) -> tuple:
+    """A tracker that always saturates must make `penalty` behave like `flat`.
+
+    cms_mech_penalty clamps `count * cms_penalty_ns` to cms_adjust_max_ns;
+    cms_mech_flat clamps cms_flat_ns the same way. With a saturating count
+    both apply exactly cms_adjust_max_ns to every task reaching the
+    mechanism, so the penalty counter must be non-zero and must track the
+    flat mechanism's over the same workload.
+
+    The point is not the arithmetic, which is obvious from the source. It is
+    that `flat` is the control the project's headline rests on and nothing
+    had ever checked it from the other direction.
+    """
+    counts = {}
+    for label, args in (("saturate", ("--tracker", "test_saturate",
+                                      "--mechanism", "penalty")),
+                        ("flat", ("--tracker", "exact",
+                                  "--mechanism", "flat",
+                                  "--flat-ns", "4000000"))):
+        with Scheduler(binary, *args, "--stats", "60"):
+            pids = [spawn(f"sat{label}{i}", 400) for i in range(8)]
+            time.sleep(2.0)
+            b = read_bss()
+            for pid in pids:
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+        counts[label] = (int(b.get("cms_penalties_applied", -1)),
+                         int(b.get("runnable_events", 0)))
+
+    sat, flat = counts["saturate"], counts["flat"]
+    if sat[0] <= 0:
+        return FAIL, (f"saturating tracker applied {sat[0]} penalties -- "
+                      f"expected one per enqueue reaching the mechanism")
+    if flat[0] <= 0:
+        return FAIL, f"flat applied {flat[0]} penalties -- control itself is broken"
+
+    # Both should adjust essentially every enqueue that reaches the
+    # mechanism. Compare rates rather than absolute counts, since the two
+    # runs see different numbers of wakeups.
+    sat_rate = sat[0] / max(sat[1], 1)
+    flat_rate = flat[0] / max(flat[1], 1)
+    if abs(sat_rate - flat_rate) > 0.25:
+        return FAIL, (f"penalty-per-wakeup differs: saturate {sat_rate:.2f} "
+                      f"vs flat {flat_rate:.2f} -- the two should clamp alike")
+    return PASS, (f"saturate {sat[0]}/{sat[1]}, flat {flat[0]}/{flat[1]} "
+                  f"(rates {sat_rate:.2f} vs {flat_rate:.2f})")
+
+
+def test_every_registered_tracker_loads(binary: str) -> tuple:
+    """Every tracker in CMS_TRACKER_LIST attaches, including the controls.
+
+    Weaker than the two above but it covers the rows they do not, and it
+    fails loudly if a registered tracker was never given a working init.
+    """
+    trackers = ["exact", "sketch", "test_null", "test_saturate"]
+    for t in trackers:
+        with Scheduler(binary, "--tracker", t, "--mechanism", "penalty",
+                       "--stats", "60"):
+            time.sleep(0.4)
+            state = open("/sys/kernel/sched_ext/state").read().strip()
+            if state != "enabled":
+                return FAIL, f"--tracker {t}: state was {state!r}, not enabled"
+    return PASS, f"{len(trackers)} trackers attach"
+
+
 TESTS = [
     ("attach_detach_matrix", test_attach_detach_matrix, False),
     ("window_rotation_advances", test_window_rotation_advances, False),
     ("mechanism_reach_reported", test_mechanism_reach_reported, False),
     # Both xfail for the same underlying reason -- see module docstring.
+    ("null_tracker_inert", test_null_tracker_is_inert, False),
+    ("saturate_tracker_clamps", test_saturate_tracker_clamps, False),
+    ("all_trackers_load", test_every_registered_tracker_loads, False),
     ("concurrent_stress", test_concurrent_stress, True),
     ("known_roll_race", test_known_roll_race, True),
 ]

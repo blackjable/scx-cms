@@ -49,8 +49,9 @@ struct {
  * ANSWERED, and not in favour of the explanation that motivated this
  * map. Holding capacity at 42 entries and varying the identity
  * population instead shows the LRU retaining counts perfectly well at 8
- * and 20 identities (781.2 and 456.2 mean) and collapsing only at 100
- * and 300. Were the free lists responsible it would fail at 42 entries
+ * and 20 identities (medians 843.8 and 410.2 across five runs, against
+ * 1.5-2.5 when overcommitted -- a 164x separation) and collapsing only at
+ * 100 and 300. Were the free lists responsible it would fail at 42 entries
  * regardless of the population. The collapse tracks OVERCOMMITMENT, not
  * map size, which is what any LRU does below its working set. See
  * REVISIONS.md revision 12 in the research repository.
@@ -189,4 +190,22 @@ static __always_inline u64 cms_exact_query(u64 id)
 	cms_roll(c, cms_epoch);
 
 	return c->cur + c->prev;
+}
+
+/*
+ * The exact tracker has no per-rotation work: entries carry the epoch they
+ * were last touched and roll themselves forward lazily on next access, so
+ * closing a window is just the shared `cms_epoch` bump the timer already
+ * does. These exist so that every registered tracker presents the same four
+ * operations and the dispatcher needs no special case -- the alternative is
+ * a `if (tracker != exact)` in the timer path, which is exactly the kind of
+ * per-tracker exception the registry exists to remove.
+ */
+static __always_inline void cms_exact_rotate(void)
+{
+}
+
+static __always_inline s32 cms_exact_init(void)
+{
+	return 0;
 }
