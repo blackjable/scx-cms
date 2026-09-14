@@ -110,14 +110,17 @@ can be reproduced, not because it is usable.
 ## Results, data, and what was retracted
 
 The research repository holds the paper draft, the benchmark harnesses,
-the raw output of every run, and a record of twelve claims that were made
-and then withdrawn — each tied to the file that produced it and the file
-that overturned it.
+the raw output of every run, and a record of thirteen claims that were
+made and then withdrawn — each tied to the file that produced it and the
+file that overturned it.
 
-The retractions are worth reading before trusting any number here. Nine
-of the twelve were caused by a faulty instrument rather than a faulty
+The retractions are worth reading before trusting any number here. Eight
+of the thirteen were caused by a faulty instrument rather than a faulty
 hypothesis, and the controls that eventually caught them (a do-nothing
-reference condition, a count-blind control, randomised condition
-ordering) are all reproducible with the flags above. Three were
-different: the measurements were correct and an untested mechanism was
-attached to them — including the one retracted above, in this file.
+reference condition, a count-blind control) are reproducible with the
+flags above.
+
+Four were a different failure: the measurements were correct and an
+untested mechanism was attached to them — including the one retracted
+above, in this file, and the condition-ordering bias that reached a
+paper and a blog post before a controlled test found no such effect.
