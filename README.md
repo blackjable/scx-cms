@@ -83,9 +83,10 @@ working on quiet tasks.
 > stops behaving like an LRU when the map is small, and blamed BPF's
 > per-CPU free lists. The measurements were right and the mechanism was
 > invented. A 42-entry LRU retains counts normally with 8 or 20
-> identities (781.2 and 456.2) and collapses only at 100 or 300, so the
-> failure tracks *overcommitment* rather than map size — which is what
-> any LRU does below its working set, and not news about BPF. The
+> identities (medians 843.8 and 410.2 across five runs) and collapses
+> only at 100 or 300 — a 164x separation — so the failure tracks
+> *overcommitment* rather than map size, which is what any LRU does
+> below its working set, and not news about BPF. The
 > withdrawn prediction that the threshold scales with CPU count goes
 > with it. See `REVISIONS.md` revision 12 in the research repository.
 
